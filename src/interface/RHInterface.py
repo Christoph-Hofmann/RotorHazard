@@ -64,7 +64,7 @@ RHFEAT_IAP_FIRMWARE = 0x0010    # in-application programming of firmware support
 
 UPDATE_SLEEP = float(os.environ.get('RH_UPDATE_INTERVAL', '0.1')) # Main update loop delay
 MAX_RETRY_COUNT = 4 # Limit of I/O retries
-MAX_FREQUENCY_RETRY_COUNT = 10 # Limit of retries for frequency setting
+MAX_FREQUENCY_RETRY_COUNT = 20 # Limit of retries for frequency setting
 MIN_RSSI_VALUE = 1               # reject RSSI readings below this value
 
 logger = logging.getLogger(__name__)
@@ -530,41 +530,55 @@ class RHInterface(BaseHardwareInterface):
         node = self.nodes[node_index]
         node.debug_pass_count = 0  # reset debug pass count on frequency change
 
+        if not frequency:
+            # Node disabled: write power-down frequency, store 0
+            self.set_and_validate_value_16(node,
+                WRITE_FREQUENCY, READ_FREQUENCY,
+                1111 if node.api_level >= 24 else 5800)
+            node.frequency = 0
+            return True
+
+        if node.api_level < 36:
+            # Older firmware: no SPI register test available, readback only
+            node.frequency = self.set_and_validate_value_16(node,
+                WRITE_FREQUENCY, READ_FREQUENCY, frequency)
+            return True
+
+        # API >= 36: write frequency then immediately block ALL greenlets so the
+        # node MCU can finish its SPI bit-bang to the RX5808 uninterrupted.
+        #
+        # The previous approach called set_and_validate_value_16 (write + readback)
+        # before the blocking sleep.  The gevent.sleep inside with_i2c is a
+        # cooperative yield point where the RSSI update greenlet can wake and
+        # issue I2C reads that generate interrupts on the node MCU mid-SPI-transaction,
+        # corrupting the frequency write for edge-of-band frequencies (e.g. 5925 MHz).
+        #
+        # By doing a bare write_block followed immediately by _blocking_sleep we
+        # guarantee no greenlet runs between the write and the settle window.
+        # 50 ms covers the SPI transaction plus RX5808 VCO settle at all frequencies
+        # (30 ms is the minimum for edge frequencies; 50 ms adds safety margin).
         success = False
         retry_count = 0
-        while success is False and retry_count <= MAX_FREQUENCY_RETRY_COUNT:
-            if frequency:
-                node.frequency = self.set_and_validate_value_16(node,
-                    WRITE_FREQUENCY,
-                    READ_FREQUENCY,
-                    frequency)
-            else:  # if freq=0 (node disabled) then write frequency value to power down rx module, but save 0 value
-                self.set_and_validate_value_16(node,
-                    WRITE_FREQUENCY,
-                    READ_FREQUENCY,
-                    1111 if node.api_level >= 24 else 5800)
-                node.frequency = 0
-
-            # run register test to see if RX has stored frequency value
-            if frequency and node and node.api_level >= 36:
-                # Use blocking time.sleep (not gevent.sleep) so no other greenlet
-                # can issue I2C reads to this node while its MCU is bit-banging
-                # the SPI transaction into the RX5808.  gevent.sleep is cooperative
-                # and allows the RSSI update loop to run and interrupt the SPI write.
-                _blocking_sleep(
-                    0.03)  # IMPORTANT: Delay time for RX5808 VCOs and circuitry to settle after writing freq and before reading register 0x01 (20ms is optimal, 30ms is safer, can be longer but not shorter). Erroneous results will occur if delay is too short
-                test_result = self.get_value_8(node, TEST_RX_REGISTER)
-                if test_result:
-                    success = True
-                else:
-                    retry_count = retry_count + 1
-                    self.log('Frequency not validated (try={0}): frequency={1}, node={2}'. \
-                        format(retry_count, frequency, node_index + 1))
-                    _blocking_sleep(0.05)  # extra settle between retries for hardware recovery
-            else:
-                # assume success on lower API levels where test does not exist
-                # assume success on disable (frequency=0)
+        while not success and retry_count <= MAX_FREQUENCY_RETRY_COUNT:
+            node.write_block(self, WRITE_FREQUENCY, pack_16(frequency))
+            _blocking_sleep(0.050)  # block ALL greenlets: SPI tx + VCO settle
+            readback = self.get_value_16(node, READ_FREQUENCY)
+            if readback != frequency:
+                retry_count += 1
+                self.log('Frequency write/readback mismatch (try={0}): '
+                         'wrote={1}, got={2}, node={3}'.format(
+                         retry_count, frequency, readback, node_index + 1))
+                _blocking_sleep(0.05 * retry_count)
+                continue
+            test_result = self.get_value_8(node, TEST_RX_REGISTER)
+            if test_result:
+                node.frequency = frequency
                 success = True
+            else:
+                retry_count += 1
+                self.log('Frequency not validated (try={0}): frequency={1}, node={2}'.format(
+                    retry_count, frequency, node_index + 1))
+                _blocking_sleep(0.05 * retry_count)
 
         return success
 
