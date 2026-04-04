@@ -546,13 +546,7 @@ class RHInterface(BaseHardwareInterface):
 
         # API >= 36: write frequency then immediately block ALL greenlets so the
         # node MCU can finish its SPI bit-bang to the RX5808 uninterrupted.
-        #
-        # The previous approach called set_and_validate_value_16 (write + readback)
-        # before the blocking sleep.  The gevent.sleep inside with_i2c is a
-        # cooperative yield point where the RSSI update greenlet can wake and
-        # issue I2C reads that generate interrupts on the node MCU mid-SPI-transaction,
-        # corrupting the frequency write for edge-of-band frequencies (e.g. 5925 MHz).
-        #
+        #         
         # By doing a bare write_block followed immediately by _blocking_sleep we
         # guarantee no greenlet runs between the write and the settle window.
         # 50 ms covers the SPI transaction plus RX5808 VCO settle at all frequencies
