@@ -64,7 +64,7 @@ RHFEAT_IAP_FIRMWARE = 0x0010    # in-application programming of firmware support
 
 UPDATE_SLEEP = float(os.environ.get('RH_UPDATE_INTERVAL', '0.1')) # Main update loop delay
 MAX_RETRY_COUNT = 4 # Limit of I/O retries
-MAX_FREQUENCY_RETRY_COUNT = 20 # Limit of retries for frequency setting
+MAX_FREQUENCY_RETRY_COUNT = 4    # Limit of retries for frequency setting
 MIN_RSSI_VALUE = 1               # reject RSSI readings below this value
 
 logger = logging.getLogger(__name__)
